@@ -44,6 +44,10 @@ from langchain_core.messages import (
 )
 from langchain_core.tools import tool
 from langchain_groq import ChatGroq
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.vectorstores import FAISS
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -57,6 +61,67 @@ load_dotenv()
 
 llm = ChatGroq(model="qwen/qwen3.6-27b", temperature=0.5, max_tokens=900)
 tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+
+
+# --------------------------------------------------------------------------
+# RAG index (PDF -> chunks -> embeddings -> FAISS)
+# --------------------------------------------------------------------------
+# Configurable so this isn't hardcoded to one machine's absolute path; set
+# RAG_PDF_PATH in your .env if you want a different source document.
+_RAG_PDF_PATH = os.getenv(
+    "RAG_PDF_PATH",
+    "F:/newAgent/Data/The Prevalence of Sleep Disorders in College Students  Impact on Academic Performance.pdf",
+)
+_FAISS_INDEX_DIR = "faiss_index"
+
+_embedding = HuggingFaceEmbeddings(model="sentence-transformers/all-MiniLM-L6-v2")
+
+if os.path.isdir(_FAISS_INDEX_DIR):
+    # Reuse the index saved on a previous run instead of re-loading the PDF
+    # and re-embedding every chunk on every startup.
+    vector_store = FAISS.load_local(
+        _FAISS_INDEX_DIR,
+        _embedding,
+        allow_dangerous_deserialization=True,
+    )
+else:
+    loader = PyPDFLoader(file_path=_RAG_PDF_PATH)
+    data = loader.load()
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    chunks = splitter.split_documents(data)
+    vector_store = FAISS.from_documents(chunks, _embedding)
+    vector_store.save_local(_FAISS_INDEX_DIR)
+
+retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 4})
+
+
+def add_pdf_to_index(file_bytes: bytes, filename: str = "uploaded.pdf") -> int:
+    """
+    Ingest a PDF (as raw bytes, e.g. from a Streamlit file upload) into the
+    existing FAISS index so rag_tool can retrieve from it immediately, and
+    persist the updated index to disk. Returns the number of chunks added.
+    """
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp.write(file_bytes)
+        tmp_path = tmp.name
+
+    try:
+        loader = PyPDFLoader(file_path=tmp_path)
+        data = loader.load()
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        chunks = splitter.split_documents(data)
+        for chunk in chunks:
+            # Replace the temp file's path with the original filename so
+            # citations in rag_tool's output are meaningful to the user.
+            chunk.metadata["source"] = filename
+
+        vector_store.add_documents(chunks)
+        vector_store.save_local(_FAISS_INDEX_DIR)
+        return len(chunks)
+    finally:
+        os.remove(tmp_path)
 
 
 # --------------------------------------------------------------------------
@@ -160,7 +225,34 @@ def get_current_weather(city: str, units: str = "metric"):
         return {"error": f"Unexpected response format, missing key: {e}"}
 
 
-tools = [search_tool, Calculator, get_stock_price, get_current_weather]
+@tool
+def rag_tool(query: str) -> str:
+    """
+    Retrieve relevant information from the PDF document that has been
+    indexed for this app. Use this tool when the user asks a factual or
+    conceptual question that may be answered by the stored PDF content.
+
+    Args:
+        query: The question or search query used to retrieve PDF content.
+    """
+    documents = retriever.invoke(query)
+    if not documents:
+        return "No relevant information was found in the PDF."
+
+    formatted = []
+    for index, document in enumerate(documents, start=1):
+        source = document.metadata.get("source", "unknown")
+        page = document.metadata.get("page", "unknown")
+        formatted.append(
+            f"Document: {index}\n"
+            f"Source: {source}\n"
+            f"Page: {page}\n"
+            f"Content: {document.page_content}"
+        )
+    return _truncate("\n\n".join(formatted))
+
+
+tools = [search_tool, Calculator, get_stock_price, get_current_weather, rag_tool]
 llm_with_tools = llm.bind_tools(tools=tools)
 
 # Lightweight token counter for trim_messages -- avoids depending on the
@@ -187,29 +279,69 @@ conn = sqlite3.connect(database="chatbot.db", check_same_thread=False)
 checkpoint = SqliteSaver(conn)
 
 
+_WAIT_TIME_PATTERN = re.compile(r"try again in (?:(\d+)m)?([\d.]+)s")
+
+# Per-minute limits give short waits (seconds) worth auto-retrying through.
+# Daily (TPD) limits give waits of several minutes -- blocking a Streamlit
+# request that long is a bad idea, so above this threshold we surface a
+# friendly message instead of sleeping.
+_MAX_AUTO_RETRY_WAIT_SECONDS = 60.0
+
+
+def _parse_wait_seconds(error_message: str) -> float | None:
+    """
+    Parse Groq's "try again in ...s" wait time, which comes in two formats:
+    "try again in 21.06s" (seconds only) or "try again in 16m13.296s"
+    (minutes + seconds, seen on daily/TPD limits). Returns None if the
+    message doesn't match either format.
+    """
+    match = _WAIT_TIME_PATTERN.search(error_message)
+    if not match:
+        return None
+    minutes = float(match.group(1)) if match.group(1) else 0.0
+    seconds = float(match.group(2))
+    return minutes * 60 + seconds
+
+
 def _invoke_with_rate_limit_retry(model, messages, max_retries: int = 3):
     """
-    Call model.invoke(messages), retrying on Groq's 429 rate-limit errors.
-
-    Groq's error message includes how long to wait (e.g. "try again in
-    21.06s") -- we parse that and sleep for it (plus a small buffer)
-    instead of failing the whole request outright. This is different from
-    the tool_use_failed retry below: that one is a malformed-generation
-    issue, this one is "you're over budget, wait and resubmit the exact
-    same request."
+    Call model.invoke(messages), retrying on Groq's 429 rate-limit errors --
+    but only for short (per-minute) waits. Longer waits (typically a daily
+    token cap) are re-raised so the caller can show a friendly message
+    instead of blocking the request for several minutes.
     """
-    wait_pattern = re.compile(r"try again in ([\d.]+)s")
     for attempt in range(max_retries):
         try:
             return model.invoke(messages)
         except RateLimitError as e:
+            wait_seconds = _parse_wait_seconds(str(e))
+            if wait_seconds is None:
+                wait_seconds = 5.0
+            if wait_seconds > _MAX_AUTO_RETRY_WAIT_SECONDS:
+                raise
             if attempt == max_retries - 1:
                 raise
-            match = wait_pattern.search(str(e))
-            wait_seconds = float(match.group(1)) + 1 if match else 5.0
-            time.sleep(wait_seconds)
+            time.sleep(wait_seconds + 1)
     # Unreachable, but keeps type checkers happy.
     raise RuntimeError("Exceeded max retries for rate-limited request.")
+
+
+def _rate_limit_message(e: RateLimitError) -> AIMessage:
+    """Friendly, non-crashing response for a rate limit we won't auto-retry."""
+    wait_seconds = _parse_wait_seconds(str(e))
+    if wait_seconds is not None:
+        minutes, seconds = divmod(int(wait_seconds), 60)
+        wait_str = f"{minutes}m{seconds}s" if minutes else f"{seconds}s"
+        wait_note = f"Please try again in about {wait_str}."
+    else:
+        wait_note = "Please try again shortly."
+    return AIMessage(
+        content=(
+            "⚠️ I've hit Groq's rate limit for this model/tier and can't "
+            f"respond right now. {wait_note} "
+            "(You can also upgrade your Groq tier for more headroom.)"
+        )
+    )
 
 
 def chatbot(state: chatState):
@@ -233,15 +365,22 @@ def chatbot(state: chatState):
         # Qwen occasionally emits a malformed tool_call on Groq; retry once
         # without tool binding instead of crashing the whole run.
         if "tool_use_failed" in str(e):
-            fallback = _invoke_with_rate_limit_retry(llm, trimmed)
-            response = AIMessage(
-                content=(
-                    "(A tool call failed to generate correctly, so here's a "
-                    "plain answer instead.)\n\n" + fallback.content
+            try:
+                fallback = _invoke_with_rate_limit_retry(llm, trimmed)
+                response = AIMessage(
+                    content=(
+                        "(A tool call failed to generate correctly, so here's a "
+                        "plain answer instead.)\n\n" + fallback.content
+                    )
                 )
-            )
+            except RateLimitError as rate_err:
+                response = _rate_limit_message(rate_err)
         else:
             raise
+    except RateLimitError as e:
+        # A long wait (e.g. daily token cap) wasn't auto-retried -- show a
+        # friendly message in the chat instead of crashing the app.
+        response = _rate_limit_message(e)
 
     return {"messages": [response]}
 
