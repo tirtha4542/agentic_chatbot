@@ -25,6 +25,27 @@ From test_tool.py: the tool-calling graph (search / calculator / stock /
                         without tool-binding if Groq reports a malformed
                         tool_call (`tool_use_failed`), which happens
                         occasionally with Qwen on Groq.
+
+Caching added:
+  - LLM responses are cached to llm_cache.db via langchain's SQLiteCache,
+    so an identical (prompt -> response) pair costs zero tokens on a repeat.
+  - search_tool / get_stock_price / get_current_weather results are cached
+    to a local `tool_cache/` directory via diskcache, with short TTLs
+    (5-10 min) since these values go stale -- avoids hammering Tavily /
+    Alpha Vantage / OpenWeatherMap (each with their own free-tier limits)
+    for a query that was just answered.
+
+Human-in-the-loop approval added:
+  - A new `buy_stock` tool represents placing a real order (mocked here --
+    swap the body for a real brokerage API call). Because this is an
+    action with real-world consequences (unlike the read-only tools),
+    the graph routes any `buy_stock` tool call through an `approval` node
+    first, which calls `interrupt()` and pauses the graph until the human
+    responds with approve/reject via `Command(resume=...)`. Only after
+    approval does execution continue to the normal ToolNode. If rejected,
+    the pending tool_call is answered with a ToolMessage saying so (so the
+    next LLM call doesn't choke on an unresolved tool_call), and the flow
+    returns straight to the chatbot node instead of executing the trade.
 """
 
 import json
@@ -36,10 +57,13 @@ import time
 
 from dotenv import load_dotenv
 from groq import BadRequestError, RateLimitError
+from langchain_community.cache import SQLiteCache
+from langchain_core.globals import set_llm_cache
 from langchain_core.messages import (
     AIMessage,
     BaseMessage,
     HumanMessage,
+    ToolMessage,
     trim_messages,
 )
 from langchain_core.tools import tool
@@ -52,14 +76,30 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.types import interrupt, Command
 from tavily import TavilyClient
 from typing import Annotated, TypedDict
+from diskcache import Cache
 import requests
 import tiktoken
 
 load_dotenv()
 
-llm = ChatGroq(model="qwen/qwen3.6-27b", temperature=0.5, max_tokens=900)
+# --------------------------------------------------------------------------
+# Caching
+# --------------------------------------------------------------------------
+# 1) LLM response cache: identical (prompt -> response) pairs are served
+#    from a local SQLite file instead of calling Groq again -- free, and
+#    directly cuts token usage against the rate limits we've been hitting.
+set_llm_cache(SQLiteCache(database_path="llm_cache.db"))
+
+# 2) Tool output cache: search / stock / weather all hit external APIs
+#    that have their own rate limits, and the same query is often repeated
+#    (testing, or a user asking the same thing twice). diskcache persists
+#    to disk (survives restarts) and supports a per-entry TTL.
+tool_cache = Cache("tool_cache")
+
+llm = ChatGroq(model="openai/gpt-oss-20b", temperature=0.5, max_tokens=900)
 tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
 
@@ -142,6 +182,9 @@ def _truncate(text: str, limit: int = _MAX_TOOL_OUTPUT_CHARS) -> str:
 @tool
 def search_tool(query: str) -> str:
     """Search the web for current information. Input should be a plain search query string."""
+    cache_key = f"search:{query.strip().lower()}"
+    if cache_key in tool_cache:
+        return tool_cache[cache_key]
     try:
         result = tavily_client.search(
             query=query,
@@ -149,7 +192,9 @@ def search_tool(query: str) -> str:
             topic="general",
             search_depth="advanced",
         )
-        return _truncate(json.dumps(result))
+        output = _truncate(json.dumps(result))
+        tool_cache.set(cache_key, output, expire=600)  # 10 min -- news/search results go stale
+        return output
     except Exception as e:
         return f"Search failed: {e}"
 
@@ -176,13 +221,18 @@ def Calculator(expression: str) -> str:
 @tool
 def get_stock_price(symbol: str) -> dict:
     """Fetch latest stock price for a given ticker symbol using Alpha Vantage."""
+    cache_key = f"stock:{symbol.strip().upper()}"
+    if cache_key in tool_cache:
+        return tool_cache[cache_key]
     api_key = os.getenv("ALPHA_VANTAGE_API_KEY")
     url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey={api_key}"
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
         data = response.json()
-        return json.loads(_truncate(json.dumps(data)))
+        result = json.loads(_truncate(json.dumps(data)))
+        tool_cache.set(cache_key, result, expire=300)  # 5 min -- prices move
+        return result
     except requests.exceptions.RequestException as e:
         return {"error": str(e)}
 
@@ -199,6 +249,10 @@ def get_current_weather(city: str, units: str = "metric"):
     Returns:
         dict: Parsed weather data, or an error dict if the request failed
     """
+    cache_key = f"weather:{city.strip().lower()}:{units}"
+    if cache_key in tool_cache:
+        return tool_cache[cache_key]
+
     api_key = os.getenv("OPENWEATHER_API_KEY")
     url = "https://api.openweathermap.org/data/2.5/weather"
     params = {"q": city, "appid": api_key, "units": units}
@@ -207,7 +261,7 @@ def get_current_weather(city: str, units: str = "metric"):
         response.raise_for_status()
         data = response.json()
 
-        return {
+        result = {
             "city": data["name"],
             "country": data["sys"]["country"],
             "temperature": data["main"]["temp"],
@@ -217,6 +271,8 @@ def get_current_weather(city: str, units: str = "metric"):
             "weather": data["weather"][0]["description"],
             "wind_speed": data["wind"]["speed"],
         }
+        tool_cache.set(cache_key, result, expire=600)  # 10 min -- weather doesn't change that fast
+        return result
     except requests.exceptions.HTTPError as e:
         return {"error": f"HTTP error: {e}"}
     except requests.exceptions.RequestException as e:
@@ -252,7 +308,38 @@ def rag_tool(query: str) -> str:
     return _truncate("\n\n".join(formatted))
 
 
-tools = [search_tool, Calculator, get_stock_price, get_current_weather, rag_tool]
+@tool
+def buy_stock(symbol: str, quantity: int) -> dict:
+    """
+    Place a buy order for a stock ticker. Use this ONLY when the user
+    explicitly asks to buy/purchase shares, e.g. "buy 10 shares of TSLA"
+    or "please buy 20 BMW stock". Do not use this for price lookups --
+    use get_stock_price for that.
+
+    Args:
+        symbol: Ticker symbol to buy, e.g. "TSLA", "BMW".
+        quantity: Number of shares to buy.
+    """
+    # NOTE: this is a mocked/simulated execution. Swap the body of this
+    # function for a real brokerage API call (Alpaca, Interactive Brokers,
+    # etc.) when you're ready to place real orders. The approval gate in
+    # the graph (see `approval_node` below) runs regardless of what this
+    # function actually does, so wiring in a real API later is a drop-in
+    # change -- no graph changes needed.
+    return {
+        "status": "executed",
+        "symbol": symbol.strip().upper(),
+        "quantity": quantity,
+        "note": "Simulated order -- no real trade was placed.",
+    }
+
+
+# Tool names that must be approved by a human before they run. buy_stock is
+# the only one right now, but any future action-with-consequences tool
+# (sell_stock, send_email, place_order, ...) can just be added here.
+_APPROVAL_REQUIRED_TOOLS = {"buy_stock"}
+
+tools = [search_tool, Calculator, get_stock_price, get_current_weather, rag_tool, buy_stock]
 llm_with_tools = llm.bind_tools(tools=tools)
 
 # Lightweight token counter for trim_messages -- avoids depending on the
@@ -385,14 +472,101 @@ def chatbot(state: chatState):
     return {"messages": [response]}
 
 
+def approval_node(state: chatState):
+    """
+    Runs only when the last AIMessage contains a tool_call for one of the
+    _APPROVAL_REQUIRED_TOOLS (currently just buy_stock). Pauses the graph
+    with interrupt() and waits for a human decision delivered via
+    Command(resume={"approved": "yes"/"no"}).
+
+    - If approved: returns no new messages, and routing sends the state on
+      to the real ToolNode, which executes buy_stock normally.
+    - If rejected: answers the pending tool_call directly with a
+      ToolMessage so the model isn't left with a dangling, unanswered
+      tool_call (which would break the next LLM turn), and routing sends
+      the state straight back to the chatbot node -- no trade is executed.
+    """
+    last = state["messages"][-1]
+    call = next(
+        c for c in last.tool_calls if c["name"] in _APPROVAL_REQUIRED_TOOLS
+    )
+
+    decision = interrupt(
+        {
+            "type": "approval",
+            "reason": "Confirm this stock purchase before it is executed.",
+            "action": call["args"],
+            "tool": call["name"],
+            "instruction": "Approve this purchase? yes/no",
+        }
+    )
+
+    approved = str(decision.get("approved", "")).strip().lower() in ("yes", "y", "true")
+
+    if not approved:
+        return {
+            "messages": [
+                ToolMessage(
+                    content=(
+                        f"Purchase request {call['args']} was NOT approved "
+                        "by the user. No order was placed."
+                    ),
+                    tool_call_id=call["id"],
+                )
+            ]
+        }
+
+    # Approved -- no message to add here; the real ToolNode will execute
+    # buy_stock and append its ToolMessage next.
+    return {"messages": []}
+
+
+def route_after_chatbot(state: chatState):
+    """
+    After the chatbot node runs: if it made no tool calls, end the turn.
+    If any tool call is on the approval list, go through approval first.
+    Otherwise go straight to the normal tool node (search/calc/etc. never
+    need approval).
+    """
+    last = state["messages"][-1]
+    tool_calls = getattr(last, "tool_calls", None)
+    if not tool_calls:
+        return END
+    if any(c["name"] in _APPROVAL_REQUIRED_TOOLS for c in tool_calls):
+        return "approval"
+    return "tools"
+
+
+def route_after_approval(state: chatState):
+    """
+    If approval_node already answered the tool_call itself (the rejection
+    path, which appends a ToolMessage), skip the real tool node entirely
+    and let the chatbot respond to the rejection. Otherwise (approved),
+    proceed to the real tool node to actually execute buy_stock.
+    """
+    if isinstance(state["messages"][-1], ToolMessage):
+        return "chatbot"
+    return "tools"
+
+
 tool_node = ToolNode(tools)
 
 graph = StateGraph(chatState)
 graph.add_node("chatbot", chatbot)
 graph.add_node("tools", tool_node)
+graph.add_node("approval", approval_node)
 
 graph.add_edge(START, "chatbot")
-graph.add_conditional_edges("chatbot", tools_condition)
+graph.add_conditional_edges(
+    "chatbot",
+    route_after_chatbot,
+    {"approval": "approval", "tools": "tools", END: END},
+)
+graph.add_conditional_edges(
+    "approval",
+    route_after_approval,
+    {"tools": "tools", "chatbot": "chatbot"},
+)
 graph.add_edge("tools", "chatbot")
 graph.add_edge("chatbot", END)
 
@@ -415,21 +589,27 @@ if __name__ == "__main__":
         if user_input.strip().lower() == "exit":
             break
 
-        print("Bot: ", end="", flush=True)
-        bot_response = ""
-
-        for chunk, metadata in chatBot.stream(
+        # Note: interrupt() doesn't play nicely with .stream() -- when the
+        # graph hits an approval interrupt, streaming just stops without
+        # producing a final answer. So for a turn that might need approval,
+        # we invoke() (which returns cleanly with __interrupt__ set) instead
+        # of streaming. If you want token-by-token streaming back for the
+        # non-approval-needed case, you could try .stream() first and only
+        # fall back to this loop when __interrupt__ shows up -- kept simple
+        # here for clarity.
+        result = chatBot.invoke(
             {"messages": [HumanMessage(content=user_input)]},
             config=config,
-            stream_mode="messages",
-        ):
-            # Only print tokens from the chatbot node -- otherwise raw tool
-            # output (search JSON, weather dicts, etc.) from the "tools"
-            # node gets streamed and printed too, which is noisy.
-            if metadata.get("langgraph_node") != "chatbot":
-                continue
-            if chunk.content:
-                print(chunk.content, end="", flush=True)
-                bot_response += chunk.content
+        )
 
-        print()
+        while "__interrupt__" in result:
+            info = result["__interrupt__"][0].value
+            print(f"\n[Approval needed] {info['reason']}")
+            print(f"Tool: {info.get('tool')}  Action: {info.get('action')}")
+            answer = input(f"{info['instruction']} ")
+            result = chatBot.invoke(
+                Command(resume={"approved": answer}),
+                config=config,
+            )
+
+        print("Bot:", result["messages"][-1].content)
